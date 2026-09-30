@@ -17,6 +17,7 @@ by side:
 | `src/syms.rs` | `Syms.fs` | the symbol model: `Def`, `Ref`, `Tag`, `Scope` |
 | `src/cst.rs` | `Cst.fs` | concrete syntax tree nodes and elements |
 | `src/ast.rs` | `Ast.fs` | abstract elements and their projection onto symbols |
+| `src/markdown.rs` | *(Markdig)* | block and inline parser: headings, links, definitions, exclusions |
 | `src/parser.rs` | `Parser.fs` | Markdown → CST, heading disambiguation, scope computation |
 | `src/index.rs` | `Index.fs` | per-document lookup tables |
 | `src/structure.rs` | `Structure.fs` | CST + AST + symbols and the mappings between them |
@@ -67,12 +68,28 @@ exactly as you would the original.
 ## Design notes
 
 **Markdown parsing.** The original builds on Markdig with two custom inline
-parsers. This port uses `pulldown-cmark` for block structure, links and
-code/metadata spans, and hand-written scanners for wiki-links, tags and link
-reference definitions. Scanning is restricted to the regions pulldown reports as
-inline text, so code spans, code blocks, HTML, math and link destinations cannot
-contribute elements. pulldown also reports source spans for link reference
-definitions, which the original reads from Markdig's syntax tree.
+parsers for wiki links and tags. This port has no third-party Markdown
+dependency: `src/markdown.rs` is a CommonMark-subset block and inline parser
+written for what marksman actually needs. It builds no document tree; it emits
+the facts the CST is made of — heading blocks, link occurrences, link reference
+definitions, front matter, and the source regions that scanning must skip — all
+as byte offsets into the original content. Wiki links and tags are then scanned
+directly from the source, restricted to the regions the parser left open, so
+code, HTML, math and link destinations cannot contribute elements.
+
+Span conventions follow Markdig rather than CommonMark, because that is what the
+original reports: an ATX heading's span excludes its closing `##` sequence but
+keeps trailing whitespace; a setext heading's span includes its underline; a link
+title's span includes its quotes while its text does not; a `<...>` destination's
+span includes the angle brackets; and a label's span is whitespace-trimmed.
+Reference links are recognised without consulting the definitions, because the
+original patches Markdig's link parser to emit a link even when nothing matches —
+so `[foo]` is always a shortcut link.
+
+`bench/oracle/compare.py` is the differential test that pins all of this down: it
+runs 140 tricky inputs through both the original's Markdig-based parser and this
+one and diffs the elements. 139 match; the one that does not is the multi-line
+link definition described under known deviations.
 
 **Positions.** LSP `Position.character` counts UTF-16 code units, matching the
 .NET `char` indexing of the original. Internally everything is UTF-8 byte
@@ -115,23 +132,17 @@ one publication. CPU-bound work runs on `spawn_blocking`.
   URIs, so outbound non-ASCII is percent-encoded at the protocol boundary and
   inbound URIs carrying raw spaces or non-ASCII are normalized rather than
   rejected.
-- **Setext headings inside lists.** For `A\n\n-\n-` Markdig reads the two `-`
-  lines as a setext H2; pulldown-cmark reads them as two empty list items, which
-  is what CommonMark specifies. The ported regression test `no156` is ignored for
-  this reason. Where pulldown does report a setext heading the port matches
-  Markdig exactly, including the underline appearing in both the element's text
-  and its title.
-- **Multi-line shortcut-reference labels.** Markdig's `LabelSpan` for a label
-  spanning several lines starts on the wrong line; `Parser.fs` carries a `TODO`
-  about it. The port reports the label's real span instead, so regression test
-  `no235` is ignored.
+- **Multi-line link reference definitions.** When a definition spans several
+  lines, Markdig reports label/url/title offsets into the buffer it builds by
+  joining those lines, not into the source; `Parser.fs` carries a `TODO` about
+  the resulting bad spans. The port reports true source offsets, so
+  `[a]:\n  /url\n  "title"` gives `url=/url @ (1,2)-(1,6)` here and
+  `@ (1,0)-(1,4)` there. Single-line definitions, the common case, agree.
 - **`#` in a file name.** The original unescapes the whole URI before handing it
   to `System.Uri`, so a `%23` becomes a fragment separator and everything after
   it is dropped from the path. The port reproduces this, which is why the
   original's `pathFromRoot_SpecialChars` test is skipped there and ignored here,
   and why a wiki link to `blah#blah.md` resolves to nothing in both.
-- **Duplicate link-reference labels.** Only the first binds, which is what
-  CommonMark requires and what pulldown's definition map reflects.
 - **`Refs.simplifyDest` for link definitions.** The original formats the label
   through `MdLinkDef.label`, which returns a node record rather than its text, so
   F# prints a type name there. The port prints the label text. No test reaches
@@ -153,11 +164,15 @@ cargo test
 ```
 
 653 tests: 276 unit tests beside the implementation and 377 integration tests
-under `tests/`. Five are ignored — three because the original skips them too
-(`footnote_1` and `ref_to_footnote_at_link`, "footnote parsing not implemented",
-and `path_from_root_special_chars`, "`Uri` and `#` don't mix well"), and the two
-parser cases listed under known deviations. Four further gitignore cases are
-compiled only on Windows, as in the original.
+under `tests/`. 650 pass and the only three ignored are the ones the original
+skips too — `footnote_1` and `ref_to_footnote_at_link` ("footnote parsing not
+implemented") and `path_from_root_special_chars` ("`Uri` and `#` don't mix
+well"). Four further gitignore cases are compiled only on Windows, as in the
+original.
+
+The parser has a second, stronger check: `bench/oracle/compare.py` runs 140
+tricky Markdown inputs through the original's Markdig-based parser and this one
+and diffs the resulting elements. See the design notes.
 
 `conn_dependency_tests` dominates the runtime at roughly 45 s in a debug build;
 it replays randomized edit sequences of 1000 documents against a full graph
@@ -173,42 +188,46 @@ client: 20 documents are opened after load and request figures are the median of
 5 probes. Lower is better; the last column is the original's time divided by this
 port's.
 
-1500 documents, 1.18 MB of Markdown:
+1500 documents, 1.18 MB of Markdown, with a 10 s quiet window:
 
 | metric | marksman-rs | marksman (F#) | F#/rs |
 | --- | --- | --- | --- |
-| cold start (`initialize`) | 891 ms | 4686 ms | 5.3x |
-| first diagnostics settled | 693 ms | 726 ms | 1.0x |
-| completion | 5.6 ms | 8.3 ms | 1.5x |
-| definition | 1.0 ms | 1.8 ms | 1.8x |
-| references | 0.8 ms | 2.1 ms | 2.6x |
-| hover | 0.8 ms | 1.6 ms | 1.9x |
-| documentSymbol | 0.7 ms | 2.1 ms | 2.8x |
-| codeLens | 0.9 ms | 2.2 ms | 2.4x |
-| semanticTokens/full | 0.8 ms | 1.3 ms | 1.7x |
-| workspace/symbol | 9.2 ms | 47.8 ms | 5.2x |
-| edit → diagnostics | 853 ms | 1867 ms | 2.2x |
+| cold start (`initialize`) | 1027 ms | 4396 ms | 4.3x |
+| first diagnostics settled | 559 ms | 810 ms | 1.4x |
+| completion | 4.1 ms | 9.9 ms | 2.4x |
+| definition | 0.5 ms | 1.3 ms | 2.6x |
+| references | 0.5 ms | 1.6 ms | 3.2x |
+| hover | 0.6 ms | 1.0 ms | 1.7x |
+| documentSymbol | 0.6 ms | 1.4 ms | 2.3x |
+| codeLens | 0.6 ms | 1.3 ms | 2.2x |
+| semanticTokens/full | 0.5 ms | 1.0 ms | 2.0x |
+| workspace/symbol | 6.8 ms | 31.3 ms | 4.6x |
+| edit → diagnostics | 777 ms | 1554 ms | 2.0x |
 
-5000 documents, 3.94 MB of Markdown, same procedure:
+5000 documents, 3.94 MB of Markdown, with a 30 s quiet window:
 
 | metric | marksman-rs | marksman (F#) | F#/rs |
 | --- | --- | --- | --- |
-| cold start (`initialize`) | 3879 ms | 10347 ms | 2.7x |
-| first diagnostics settled | 1828 ms | 1927 ms | 1.1x |
-| completion | 11.1 ms | 12.3 ms | 1.1x |
-| definition | 0.8 ms | 1.1 ms | 1.4x |
-| references | 0.6 ms | 1.0 ms | 1.7x |
-| hover | 0.6 ms | 0.8 ms | 1.3x |
-| documentSymbol | 0.6 ms | 1.3 ms | 2.2x |
-| codeLens | 0.7 ms | 1.2 ms | 1.7x |
-| semanticTokens/full | 0.6 ms | 1.0 ms | 1.7x |
-| workspace/symbol | 18.5 ms | 57.1 ms | 3.1x |
-| edit → diagnostics | 3984 ms | not measured | — |
+| cold start (`initialize`) | 4807 ms | 11126 ms | 2.3x |
+| first diagnostics settled | 1885 ms | 1920 ms | 1.0x |
+| completion | 10.9 ms | 13.2 ms | 1.2x |
+| definition | 0.7 ms | 1.3 ms | 1.9x |
+| references | 0.5 ms | 1.1 ms | 2.2x |
+| hover | 0.5 ms | 1.1 ms | 2.2x |
+| documentSymbol | 0.4 ms | 1.1 ms | 2.8x |
+| codeLens | 0.5 ms | 1.1 ms | 2.2x |
+| semanticTokens/full | 0.5 ms | 0.9 ms | 1.8x |
+| workspace/symbol | 18.5 ms | 49.1 ms | 2.7x |
+| edit → diagnostics | 3096 ms | not measured | — |
 
 At 5000 documents the harness measures `edit → diagnostics` by waiting for a
 quiet window, and it never observes the original's post-edit publication there —
 not with a 2 s, 30 s or 90 s window. The direct comparison in the next section
-shows the original does publish, and publishes the same thing.
+shows the original does publish, and publishes the same seven diagnostics. The
+quiet window also has to be wide enough for this port: at 2 s a loaded machine
+reports nothing, which reads as a functional difference but is not one. Set
+`BENCH_STDERR_DIR` to capture each server's stderr, since a server that dies
+mid-run otherwise looks like one that simply published nothing.
 
 Fixed process startup is not the explanation for the cold-start gap:
 `marksman --version` takes 0.08 s for the original and under 0.01 s for this
@@ -220,12 +239,12 @@ own best of 5):
 
 | phase | time |
 | --- | --- |
-| read + parse | 260 ms |
-| lookup indexes + connection graph | 306 ms |
-| total load | 610 ms |
-| one-document edit (full graph rebuild) | 6.9 ms |
+| read + parse | 242 ms |
+| lookup indexes + connection graph | 271 ms |
+| total load | 558 ms |
+| one-document edit (full graph rebuild) | 8.5 ms |
 
-Throughput: 4.5 MB/s parsed, 2458 documents/s loaded.
+Throughput: 4.9 MB/s parsed, 2688 documents/s loaded.
 
 Note that a full connection-graph rebuild per document edit is the original's
 behaviour too: `core.incremental_references` defaults to `false`, so both
@@ -264,9 +283,10 @@ other order. Every value is the same.
 ## Repository layout
 
 ```
-src/            the port, one module per F# source file
-tests/          ported test suites, one file per F# test module
-tests/common/   shared fixtures, mirroring Tests/Helpers.fs
-examples/       bench_load.rs — phase timings for loading a folder
-bench/          gen_corpus.py, bench.py, lsp_smoke.py
+src/               the port, one module per F# source file
+tests/             ported test suites, one file per F# test module
+tests/common/      shared fixtures, mirroring Tests/Helpers.fs
+examples/          bench_load.rs (phase timings), dump_elements.rs (oracle)
+bench/             gen_corpus.py, bench.py, lsp_smoke.py, fixtures/
+bench/oracle/      compare.py and the F# dumper: differential parser test
 ```

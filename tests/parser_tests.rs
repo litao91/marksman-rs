@@ -630,35 +630,25 @@ mod regression_tests {
     use super::*;
 
     #[test]
-    #[ignore = "Markdig reads `-\\n-` as a setext H2; pulldown-cmark reads it as two empty list items (Rust: no elements)"]
     fn no156() {
         let content = "A\n\n-\n-";
 
         let actual = scrape_string(content);
 
-        // DIVERGENCE (different Markdown library).
-        //   F# expects a setext heading:
-        //     H2: range=(2,0)-(3,1); scope=(2,0)-(4,0)
-        //       text=`-\n-`
-        //       title=`-\n-` @ (2,0)-(3,1)
-        //   Rust actual: no elements at all ([]).
-        // Markdig treats the second `-` as a setext underline for the `-`
-        // paragraph; pulldown-cmark follows CommonMark and reads both lines as
-        // bullet list items with empty content, so no heading is produced.
-        // A second, latent divergence in the same area: where pulldown *does*
-        // produce a setext heading ("Foo\n-"), src/parser.rs `build_heading`
-        // truncates the title at the first line (title=`Foo` @ (0,0)-(0,3)),
-        // while the F# code keeps the whole block including the underline
-        // (title=`Foo\n-` @ (0,0)-(1,1)).
+        // Markdig reads a bare `-` as a paragraph rather than an empty list
+        // item, so the second `-` is a setext underline. The heading's text and
+        // title therefore both include the underline, and the snapshot lines are
+        // split where the formatted element contains a newline.
         check_inline_snapshot(&actual, &[
             "H2: range=(2,0)-(3,1); scope=(2,0)-(4,0)",
-            "  text=`-\n-`",
-            "  title=`-\n-` @ (2,0)-(3,1)",
+            "  text=`-",
+            "-`",
+            "  title=`-",
+            "-` @ (2,0)-(3,1)",
         ]);
     }
 
     #[test]
-    #[ignore = "multi-line shortcut label: F# label trimmed to (2,0)-(7,70), Rust raw bracket content (1,1)-(7,81)"]
     fn no235() {
         let content = concat!(
             "\n",

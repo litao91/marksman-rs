@@ -27,12 +27,18 @@ def encode(msg):
 
 
 class Client:
-    def __init__(self, argv):
+    def __init__(self, argv, label="server"):
+        # A server that dies mid-run otherwise looks like a server that simply
+        # published nothing, so stderr can be captured per label.
+        stderr = subprocess.DEVNULL
+        directory = os.environ.get("BENCH_STDERR_DIR")
+        if directory:
+            stderr = open(os.path.join(directory, label + ".stderr"), "wb")
         self.proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=stderr,
         )
         self.next_id = 0
         self.incoming = queue.Queue()
@@ -140,7 +146,7 @@ def run_one(label, argv, root, docs, repeats, open_count, quiet):
     result = {"label": label}
 
     t0 = time.perf_counter()
-    client = Client(argv)
+    client = Client(argv, label)
     caps = client.request(
         "initialize",
         {

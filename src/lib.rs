@@ -18,6 +18,7 @@ pub mod graph;
 pub mod index;
 pub mod lenses;
 pub mod mapping;
+pub mod markdown;
 pub mod misc;
 pub mod mmap;
 pub mod names;

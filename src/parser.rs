@@ -1,29 +1,23 @@
 //! Markdown parsing into the concrete syntax tree.
 //!
 //! Port of `Marksman.Parser`. The original builds on Markdig with two custom
-//! inline parsers; here `pulldown-cmark` supplies block structure, links and
-//! code/metadata spans, while wiki-links, tags and link reference definitions
-//! are scanned directly from the source. Scanning is restricted to the regions
-//! pulldown reports as inline text so that code, HTML and link destinations
-//! cannot contribute elements.
+//! inline parsers; here [`crate::markdown`] supplies block structure, links,
+//! link reference definitions and the regions that scanning must skip, while
+//! wiki-links and tags are scanned directly from the source. Scanning is
+//! restricted to the regions the parser left open, so that code, HTML, math and
+//! link destinations cannot contribute elements.
 
 use std::collections::HashMap;
 
 use lsp_types::{Position, Range};
-use pulldown_cmark::{BrokenLink, Event, LinkType, Options, Parser, Tag};
 
 use crate::config::ParserSettings;
+use crate::markdown;
 use crate::cst::{self, Cst, Element, Heading, MdLink, MdLinkDef, Node, Tag as CstTag, TextNode, WikiLink};
 use crate::misc::Slug;
 use crate::names::{UrlEncoded, WikiEncoded};
 use crate::structure::Structure;
 use crate::text::Text;
-
-fn parser_options() -> Options {
-    let mut opts = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
-    opts.insert(Options::ENABLE_MATH);
-    opts
-}
 
 /// Byte ranges in which no inline element may be recognised.
 struct Exclusions {
@@ -95,128 +89,6 @@ fn split_at_newlines(content: &str, start: usize, end: usize, out: &mut Vec<(usi
 
 fn range_of(text: &Text, start: usize, end: usize) -> Range {
     text.range_of_offsets(start, end)
-}
-
-/// Finds the `]` that closes the label of a link starting at `start`.
-fn find_label_close(content: &str, start: usize, end: usize) -> Option<usize> {
-    let bytes = content.as_bytes();
-    let mut i = if bytes.get(start) == Some(&b'!') { start + 1 } else { start };
-    let mut depth = 0i32;
-
-    while i < end {
-        match bytes[i] {
-            b'\\' => {
-                i += 2;
-                continue;
-            }
-            b'[' => depth += 1,
-            b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-/// A link title. Markdig reports a span that includes the surrounding quotes
-/// while the title text itself is unquoted, so the two disagree.
-struct TitleSpan {
-    text: (usize, usize),
-    range: (usize, usize),
-}
-
-/// Splits the `(destination "title")` tail of an inline link into byte ranges.
-fn parse_inline_tail(
-    content: &str,
-    open: usize,
-    close: usize,
-) -> (Option<(usize, usize)>, Option<TitleSpan>) {
-    let bytes = content.as_bytes();
-    let mut i = open + 1;
-    while i < close && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= close {
-        return (None, None);
-    }
-
-    let dest_start = i;
-    let dest_end;
-    if bytes[i] == b'<' {
-        i += 1;
-        let inner_start = i;
-        while i < close && bytes[i] != b'>' {
-            if bytes[i] == b'\\' {
-                i += 1;
-            }
-            i += 1;
-        }
-        dest_end = i.min(close);
-        let _ = inner_start;
-        if i < close {
-            i += 1;
-        }
-    } else {
-        let mut depth = 0i32;
-        while i < close {
-            match bytes[i] {
-                b'\\' => {
-                    i += 2;
-                    continue;
-                }
-                b'(' => depth += 1,
-                b')' => {
-                    if depth == 0 {
-                        break;
-                    }
-                    depth -= 1;
-                }
-                c if c.is_ascii_whitespace() => break,
-                _ => {}
-            }
-            i += 1;
-        }
-        dest_end = i;
-    }
-
-    let dest = if dest_end > dest_start {
-        Some((dest_start, dest_end))
-    } else {
-        None
-    };
-
-    while i < close && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-
-    let title = if i < close && matches!(bytes[i], b'"' | b'\'' | b'(') {
-        let opener = bytes[i];
-        let closer = if opener == b'(' { b')' } else { opener };
-        let delim_start = i;
-        let inner_start = i + 1;
-        i += 1;
-        while i < close && bytes[i] != closer {
-            if bytes[i] == b'\\' {
-                i += 1;
-            }
-            i += 1;
-        }
-        let inner_end = i.min(close);
-        if inner_end > inner_start && i < close {
-            Some(TitleSpan { text: (inner_start, inner_end), range: (delim_start, i + 1) })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    (dest, title)
 }
 
 /// One recognised `[[doc#heading|title]]` occurrence, as inclusive byte spans.
@@ -364,8 +236,10 @@ fn scan_wiki_links(content: &str, region: (usize, usize), exclusions: &Exclusion
     out
 }
 
+/// Markdig's `IsAlphaNumeric` is ASCII-only, so a tag name is ASCII too: `#タグ`
+/// is not a tag.
 fn is_tag_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '-' || c == '_' || c == '/'
+    c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/'
 }
 
 struct TagMatch {
@@ -385,7 +259,7 @@ fn scan_tags(content: &str, region: (usize, usize)) -> Vec<TagMatch> {
         }
         let start = region.0 + rel;
         let prev = content[..start].chars().next_back();
-        if prev.is_some_and(|p| p.is_alphanumeric()) {
+        if prev.is_some_and(|p| p.is_ascii_alphanumeric()) {
             continue;
         }
 
@@ -406,220 +280,32 @@ fn scan_tags(content: &str, region: (usize, usize)) -> Vec<TagMatch> {
     out
 }
 
-/// A `[label]: destination "title"` definition located within a known span.
-struct LinkDefMatch {
-    full: (usize, usize),
-    label: (usize, usize),
-    url: (usize, usize),
-    title: Option<TitleSpan>,
-}
-
-fn is_def_whitespace(b: u8) -> bool {
-    b.is_ascii_whitespace()
-}
-
-/// Splits a link reference definition into its label, destination and title
-/// spans. The definition may span several lines.
-fn parse_link_def_span(content: &str, start: usize, end: usize) -> Option<LinkDefMatch> {
-    let bytes = content.as_bytes();
-    if bytes.get(start) != Some(&b'[') {
-        return None;
-    }
-
-    let label_start = start + 1;
-    let mut j = label_start;
-    while j < end && bytes[j] != b']' {
-        if bytes[j] == b'\\' {
-            j += 1;
-        }
-        j += 1;
-    }
-    if j >= end || j == label_start {
-        return None;
-    }
-    let label_end = j;
-    j += 1;
-
-    let mut k = j;
-    while k < end && is_def_whitespace(bytes[k]) {
-        k += 1;
-    }
-    if bytes.get(k) != Some(&b':') {
-        return None;
-    }
-    k += 1;
-    while k < end && is_def_whitespace(bytes[k]) {
-        k += 1;
-    }
-    if k >= end {
-        return None;
-    }
-
-    let url = if bytes[k] == b'<' {
-        k += 1;
-        let inner = k;
-        while k < end && bytes[k] != b'>' {
-            if bytes[k] == b'\\' {
-                k += 1;
-            }
-            k += 1;
-        }
-        if k >= end {
-            return None;
-        }
-        let span = (inner, k);
-        k += 1;
-        span
-    } else {
-        let s = k;
-        while k < end && !is_def_whitespace(bytes[k]) {
-            k += 1;
-        }
-        (s, k)
-    };
-    if url.1 == url.0 {
-        return None;
-    }
-
-    let mut t = k;
-    while t < end && is_def_whitespace(bytes[t]) {
-        t += 1;
-    }
-    let title = if t < end && matches!(bytes[t], b'"' | b'\'' | b'(') {
-        let opener = bytes[t];
-        let closer = if opener == b'(' { b')' } else { opener };
-        let delim_start = t;
-        let inner_start = t + 1;
-        let mut u = inner_start;
-        while u < end && bytes[u] != closer {
-            if bytes[u] == b'\\' {
-                u += 1;
-            }
-            u += 1;
-        }
-        if u >= end {
-            return None;
-        }
-        Some(TitleSpan { text: (inner_start, u), range: (delim_start, u + 1) })
-    } else {
-        None
-    };
-
-    let full_end = match &title {
-        Some(span) => span.range.1,
-        None => url.1,
-    };
-
-    Some(LinkDefMatch { full: (start, full_end), label: (label_start, label_end), url, title })
-}
-
 pub fn scrape_text(parser_settings: &ParserSettings, text: &Text) -> Vec<Element> {
     let content = &text.content;
-    let mut elements: Vec<Element> = Vec::new();
+    let scanned = markdown::scan(content);
+
     let mut exclusions = Exclusions::new();
-    let mut yaml: Option<TextNode> = None;
-    // (byte start, byte end, range, link type, resolved id)
-    let mut link_events: Vec<(usize, usize, Range, LinkType, String)> = Vec::new();
-
-    let mut broken_link = |b: BrokenLink| {
-        Some((
-            format!("/broken/{}", b.reference).into(),
-            format!("broken-{}", b.reference).into(),
-        ))
-    };
-
-    let parser = Parser::new_with_broken_link_callback(content, parser_options(), Some(&mut broken_link));
-
-    // pulldown emits no events for link reference definitions, but it does
-    // report their source spans, which is exactly what the CST needs.
-    let defs: Vec<std::ops::Range<usize>> = parser
-        .reference_definitions()
-        .iter()
-        .map(|(_, def)| def.span.clone())
-        .collect();
-
-    let events: Vec<(Event, std::ops::Range<usize>)> = parser.into_offset_iter().collect();
-
-    for (event, range) in &events {
-        match event {
-            Event::Start(Tag::CodeBlock(_)) => {
-                exclusions.push((range.start, range.end));
-            }
-            Event::Code(_) | Event::InlineMath(_) | Event::DisplayMath(_) => {
-                exclusions.push((range.start, range.end));
-            }
-            Event::Html(_) | Event::InlineHtml(_) => {
-                exclusions.push((range.start, range.end));
-            }
-            Event::Start(Tag::MetadataBlock(_)) => {
-                // YAML front matter is only front matter at the very start of the document.
-                if range.start == 0 && yaml.is_none() {
-                    yaml = Some(Node::mk_text(
-                        content[range.start..range.end].to_string(),
-                        range_of(text, range.start, range.end),
-                    ));
-                }
-                exclusions.push((range.start, range.end));
-            }
-            Event::Start(Tag::Heading { level, .. }) => {
-                let level = *level as i32;
-                let mut end = range.end;
-                while end > range.start && matches!(content.as_bytes()[end - 1], b'\n' | b'\r') {
-                    end -= 1;
-                }
-                let heading_range = range_of(text, range.start, end);
-                let heading =
-                    build_heading(parser_settings, text, content, range.start, end, level, heading_range);
-                elements.push(Element::H(heading));
-            }
-            Event::Start(Tag::Link { link_type, id, .. })
-            | Event::Start(Tag::Image { link_type, id, .. }) => {
-                // A collapsed reference's span stops before its trailing `[]`.
-                let mut end = range.end;
-                if matches!(link_type, LinkType::Collapsed | LinkType::CollapsedUnknown)
-                    && content[end..].starts_with("[]")
-                {
-                    end += 2;
-                }
-
-                link_events.push((
-                    range.start,
-                    end,
-                    range_of(text, range.start, end),
-                    *link_type,
-                    id.to_string(),
-                ));
-
-                // A shortcut link's whole source is its label, which stays
-                // scannable; the other forms have a destination that must not
-                // contribute elements.
-                match link_type {
-                    LinkType::Autolink | LinkType::Email => exclusions.push((range.start, end)),
-                    LinkType::Shortcut | LinkType::ShortcutUnknown => {}
-                    _ => {
-                        if let Some(close) = find_label_close(content, range.start, end) {
-                            exclusions.push((close, end));
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
+    for span in &scanned.exclusions {
+        exclusions.push(*span);
     }
 
-    let mut def_elements = Vec::new();
-    for span in &defs {
-        if let Some(m) = parse_link_def_span(content, span.start, span.end) {
-            exclusions.push(m.full);
-            def_elements.push(build_link_def(text, content, &m));
-        }
+    let mut elements: Vec<Element> = Vec::new();
+
+    for heading in &scanned.headings {
+        let (start, end) = heading.block;
+        let range = range_of(text, start, end);
+        let node = build_heading(parser_settings, text, content, start, end, heading.level, range);
+        elements.push(Element::H(node));
     }
+
+    let def_elements: Vec<Element> =
+        scanned.link_defs.iter().map(|def| build_link_def(text, content, def)).collect();
 
     exclusions.normalize();
 
     // Wiki links are scanned before Markdown links are materialised: `[[x]]`
-    // parses as a shortcut link over `x`, and the wiki reading wins, matching
-    // the original's inline parser priority.
+    // also reads as a shortcut link over `x`, and the wiki reading wins,
+    // matching the original's inline parser priority.
     let regions = exclusions.regions(content);
     let mut wiki_ranges = Vec::new();
     let mut wiki_elements = Vec::new();
@@ -639,25 +325,27 @@ pub fn scrape_text(parser_settings: &ParserSettings, text: &Text) -> Vec<Element
         }
     }
 
-    for (start, end, range, link_type, id) in link_events {
-        if wiki_ranges.iter().any(|w| start < w.1 && w.0 < end) {
+    for link in &scanned.links {
+        if wiki_ranges.iter().any(|w| link.full.0 < w.1 && w.0 < link.full.1) {
             continue;
         }
-        if let Some(el) = build_md_link(text, content, start, end, range, link_type, &id) {
-            elements.push(el);
-        }
+        elements.push(build_md_link(text, content, link));
     }
 
     elements.extend(def_elements);
     elements.extend(wiki_elements);
     elements.extend(tag_elements);
 
-    if let Some(y) = yaml {
-        elements.push(Element::YML(y));
+    if let Some((start, end)) = scanned.front_matter {
+        elements.push(Element::YML(Node::mk_text(
+            content[start..end].to_string(),
+            range_of(text, start, end),
+        )));
     }
 
     elements
 }
+
 
 fn build_heading(
     parser_settings: &ParserSettings,
@@ -744,87 +432,54 @@ fn build_tag(text: &Text, content: &str, t: TagMatch) -> Element {
     ))
 }
 
-fn build_md_link(
-    text: &Text,
-    content: &str,
-    start: usize,
-    end: usize,
-    range: Range,
-    link_type: LinkType,
-    id: &str,
-) -> Option<Element> {
-    let label_close = find_label_close(content, start, end)?;
-    let link_text = content[start..end].to_string();
-
-    let label_start = if content.as_bytes()[start] == b'!' { start + 1 } else { start } + 1;
-    let label_node = if label_close == label_start {
-        // Markdig leaves LabelSpan at its default for an empty label, which maps
-        // to the document's origin rather than to the brackets' position.
-        TextNode::mk_text(String::new(), range_of(text, 0, 0))
-    } else {
+fn build_md_link(text: &Text, content: &str, link: &markdown::LinkFact) -> Element {
+    let node_text = |s: markdown::SpannedText| {
         TextNode::mk_text(
-            content[label_start..label_close].to_string(),
-            range_of(text, label_start, label_close),
+            content[s.text.0..s.text.1].to_string(),
+            range_of(text, s.range.0, s.range.1),
         )
     };
-
-    let data = match link_type {
-        LinkType::Inline => {
-            // The destination tail starts at the `(` right after the label.
-            let open = label_close + 1;
-            let close = end.saturating_sub(1);
-            let (dest, title) = parse_inline_tail(content, open, close);
-            let url_node = dest.map(|(s, e)| {
-                Node::mk(content[s..e].to_string(), range_of(text, s, e), UrlEncoded::mk_unchecked(content[s..e].to_string()))
-            });
-            let title_node = title.map(|t| {
-                TextNode::mk_text(
-                    content[t.text.0..t.text.1].to_string(),
-                    range_of(text, t.range.0, t.range.1),
-                )
-            });
-            MdLink::IL(label_node, url_node, title_node)
-        }
-        LinkType::Reference => {
-            let ref_open = label_close + 2;
-            let ref_close = content[ref_open..end].find(']').map(|i| ref_open + i).unwrap_or(end);
-            let ref_node = TextNode::mk_text(content[ref_open..ref_close].to_string(), range_of(text, ref_open, ref_close));
-            MdLink::RF(label_node, ref_node)
-        }
-        LinkType::ReferenceUnknown => {
-            let ref_open = label_close + 2;
-            let ref_close = content[ref_open..end].find(']').map(|i| ref_open + i).unwrap_or(end);
-            let ref_node = TextNode::mk_text(content[ref_open..ref_close].to_string(), range_of(text, ref_open, ref_close));
-            MdLink::RF(label_node, ref_node)
-        }
-        LinkType::Collapsed | LinkType::CollapsedUnknown => MdLink::RC(label_node),
-        LinkType::Shortcut | LinkType::ShortcutUnknown => MdLink::RS(label_node),
-        LinkType::Autolink | LinkType::Email => {
-            let url_node = Node::mk(
-                id.to_string(),
-                range_of(text, start + 1, end.saturating_sub(1)),
-                UrlEncoded::mk_unchecked(id.to_string()),
-            );
-            MdLink::IL(label_node, Some(url_node), None)
-        }
-        LinkType::WikiLink { .. } => return None,
+    let node_url = |s: markdown::SpannedText| {
+        let url = content[s.text.0..s.text.1].to_string();
+        Node::mk(url.clone(), range_of(text, s.range.0, s.range.1), UrlEncoded::mk_unchecked(url))
     };
 
-    Some(Element::ML(Node::mk(link_text, range, data)))
+    let label = node_text(link.label);
+
+    let data = match link.kind {
+        markdown::LinkKind::Inline => {
+            MdLink::IL(label, link.url.map(node_url), link.title.map(node_text))
+        }
+        // The original reports a full reference link's url as the text of its
+        // `[ref]` label, which is how it tells a full reference from a collapsed
+        // one.
+        markdown::LinkKind::FullReference => MdLink::RF(label, node_text(link.url.unwrap())),
+        markdown::LinkKind::Collapsed => MdLink::RC(label),
+        markdown::LinkKind::Shortcut => MdLink::RS(label),
+    };
+
+    Element::ML(Node::mk(
+        content[link.full.0..link.full.1].to_string(),
+        range_of(text, link.full.0, link.full.1),
+        data,
+    ))
 }
 
-fn build_link_def(text: &Text, content: &str, m: &LinkDefMatch) -> Element {
-    let label_text = content[m.label.0..m.label.1].to_string();
-    let url_text = content[m.url.0..m.url.1].to_string();
 
-    let def = MdLinkDef::mk(
-        TextNode::mk_text(label_text, range_of(text, m.label.0, m.label.1)),
+fn build_link_def(text: &Text, content: &str, def: &markdown::LinkDefFact) -> Element {
+    let url_text = content[def.url.text.0..def.url.text.1].to_string();
+
+    let data = MdLinkDef::mk(
+        TextNode::mk_text(
+            content[def.label.0..def.label.1].to_string(),
+            range_of(text, def.label.0, def.label.1),
+        ),
         Node::mk(
             url_text.clone(),
-            range_of(text, m.url.0, m.url.1),
+            range_of(text, def.url.range.0, def.url.range.1),
             UrlEncoded::mk_unchecked(url_text),
         ),
-        m.title.as_ref().map(|t| {
+        def.title.map(|t| {
             TextNode::mk_text(
                 content[t.text.0..t.text.1].to_string(),
                 range_of(text, t.range.0, t.range.1),
@@ -833,11 +488,12 @@ fn build_link_def(text: &Text, content: &str, m: &LinkDefMatch) -> Element {
     );
 
     Element::MLD(Node::mk(
-        content[m.full.0..m.full.1].to_string(),
-        range_of(text, m.full.0, m.full.1),
-        def,
+        content[def.full.0..def.full.1].to_string(),
+        range_of(text, def.full.0, def.full.1),
+        data,
     ))
 }
+
 
 fn sort_elements(text: &Text, elements: &mut Vec<Element>) {
     let offsets = |el: &Element| {
@@ -1102,10 +758,12 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_label_only_binds_first() {
+    fn duplicate_labels_are_both_reported() {
+        // Only the first binds as a reference target, but the original reports
+        // every definition as an element.
         let els = scrape("[a]: /u1\n[a]: /u2\n");
         let defs: Vec<&Element> = els.iter().filter(|e| matches!(e, Element::MLD(_))).collect();
-        assert_eq!(defs.len(), 1);
+        assert_eq!(defs.len(), 2);
     }
 
     #[test]
