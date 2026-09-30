@@ -1,0 +1,29 @@
+[package]
+name = "marksman"
+version = "0.1.0"
+edition = "2021"
+description = "Marksman is a language server for Markdown"
+license = "MIT"
+
+[[bin]]
+name = "marksman"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+globset = "0.4"
+log = "0.4"
+lsp-types = "0.97"
+percent-encoding = "2"
+pulldown-cmark = { version = "0.13", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time"] }
+toml = "1"
+unicode-normalization = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1

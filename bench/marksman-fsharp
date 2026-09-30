@@ -1,0 +1,6 @@
+#!/bin/sh
+# Wrapper so the benchmark can launch the .NET build without per-command env.
+export DOTNET_ROOT=/home/garyli/.dotnet
+export PATH="$PATH:/home/garyli/.dotnet"
+export DOTNET_gcServer=1
+exec /mnt/data/repos/marksman/Marksman/bin/Release/net9.0/marksman "$@"
