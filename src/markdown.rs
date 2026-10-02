@@ -406,59 +406,72 @@ impl HtmlBlockEnd {
     }
 }
 
+/// Whether `s` begins with `prefix`, ignoring ASCII case. Comparison is done on
+/// bytes so that no lowercased copy of the line has to be allocated.
+fn starts_with_ci(s: &str, prefix: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+/// Whether `s` begins with `<` followed by `tag`, ignoring ASCII case.
+fn starts_with_open_tag(s: &str, tag: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.first() == Some(&b'<')
+        && bytes.len() >= tag.len() + 1
+        && bytes[1..tag.len() + 1].eq_ignore_ascii_case(tag.as_bytes())
+}
+
 fn html_block_end(text: &str) -> Option<HtmlBlockEnd> {
     let trimmed = text.trim_start();
-    let lower = trimmed.to_ascii_lowercase();
+    let bytes = trimmed.as_bytes();
 
-    for &(tag, token) in &[("script", "</script>"), ("pre", "</pre>"), ("style", "</style>"), ("textarea", "</textarea>")] {
-        if lower.starts_with(&format!("<{tag}")) {
-            let rest = &lower[tag.len() + 1..];
-            if rest.is_empty()
-                || rest.starts_with(' ')
-                || rest.starts_with('\t')
-                || rest.starts_with('>')
-                || rest.starts_with('\n')
-            {
-                return Some(HtmlBlockEnd::Token(token));
+    // Every HTML block start condition begins with `<`, so most lines of most
+    // documents stop here without any further work.
+    if bytes.first() != Some(&b'<') {
+        return None;
+    }
+
+    for &(tag, token) in
+        &[("script", "</script>"), ("pre", "</pre>"), ("style", "</style>"), ("textarea", "</textarea>")]
+    {
+        if starts_with_open_tag(trimmed, tag) {
+            match bytes.get(tag.len() + 1) {
+                None | Some(b' ') | Some(b'\t') | Some(b'>') | Some(b'\n') => {
+                    return Some(HtmlBlockEnd::Token(token));
+                }
+                _ => {}
             }
         }
     }
 
-    if lower.starts_with("<!--") {
+    if starts_with_ci(trimmed, "<!--") {
         return Some(HtmlBlockEnd::Token("-->"));
     }
-    if lower.starts_with("<?") {
+    if starts_with_ci(trimmed, "<?") {
         return Some(HtmlBlockEnd::Token("?>"));
     }
-    if lower.starts_with("<![cdata[") {
+    if starts_with_ci(trimmed, "<![cdata[") {
         return Some(HtmlBlockEnd::Token("]]>"));
     }
-    if lower.starts_with("<!")
-        && trimmed.as_bytes().get(2).is_some_and(|b| b.is_ascii_uppercase())
-    {
+    if starts_with_ci(trimmed, "<!") && bytes.get(2).is_some_and(|b| b.is_ascii_uppercase()) {
         return Some(HtmlBlockEnd::Token(">"));
     }
 
     // Condition 6: a complete open or close tag of a known name.
-    let bytes = trimmed.as_bytes();
-    if bytes.first() == Some(&b'<') {
-        let mut idx = 1;
-        if bytes.get(idx) == Some(&b'/') {
-            idx += 1;
-        }
-        let name_start = idx;
-        while idx < bytes.len() && bytes[idx].is_ascii_alphanumeric() {
-            idx += 1;
-        }
-        if idx > name_start {
-            let name = &lower[name_start..idx];
-            if HTML_KNOWN_TAGS.contains(&name) {
-                let after = bytes[idx];
-                if after == b' ' || after == b'\t' || after == b'>' || after == b'/' || idx == bytes.len()
-                {
-                    return Some(HtmlBlockEnd::KnownTag);
-                }
-            }
+    let mut idx = 1;
+    if bytes.get(idx) == Some(&b'/') {
+        idx += 1;
+    }
+    let name_start = idx;
+    while idx < bytes.len() && bytes[idx].is_ascii_alphanumeric() {
+        idx += 1;
+    }
+    if idx > name_start {
+        let name = &trimmed[name_start..idx];
+        let known = HTML_KNOWN_TAGS.iter().any(|tag| tag.eq_ignore_ascii_case(name));
+        if known && matches!(bytes.get(idx), None | Some(b' ') | Some(b'\t') | Some(b'>') | Some(b'/'))
+        {
+            return Some(HtmlBlockEnd::KnownTag);
         }
     }
 
@@ -729,7 +742,7 @@ impl<'a> Scanner<'a> {
     /// A `$$` line opens a display-math block running to the next `$$` line, or
     /// to the end of the document if it is never closed.
     fn math_block(&mut self, lines: &[LineSpan], start: usize) -> usize {
-        let text = &self.content[lines[start].start..lines[start].end].trim().to_string();
+        let text = self.content[lines[start].start..lines[start].end].trim();
         if text.len() > 4 && text.ends_with("$$") {
             // Opened and closed on one line.
             self.exclude(lines[start].start, lines[start].end);
@@ -1642,18 +1655,17 @@ fn email_end(rest: &str) -> Option<usize> {
 /// The offset just past an inline HTML tag or comment starting at `start`.
 fn inline_html_end(text: &str, start: usize) -> Option<usize> {
     let rest = &text[start..];
-    let lower = rest.to_ascii_lowercase();
 
-    if lower.starts_with("<!--") {
+    if starts_with_ci(rest, "<!--") {
         return rest.find("-->").map(|i| start + i + 3);
     }
-    if lower.starts_with("<?") {
+    if starts_with_ci(rest, "<?") {
         return rest.find("?>").map(|i| start + i + 2);
     }
-    if lower.starts_with("<![cdata[") {
+    if starts_with_ci(rest, "<![cdata[") {
         return rest.find("]]>").map(|i| start + i + 3);
     }
-    if lower.starts_with("<!") {
+    if starts_with_ci(rest, "<!") {
         return rest.find('>').map(|i| start + i + 1);
     }
 

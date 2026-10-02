@@ -266,17 +266,60 @@ nothing.
 ### Internal phase timings
 
 `cargo run --release --example bench_load -- <corpus> 5`, each phase its own best
-of 5. The 1500-document row is the median of three invocations; the 5000-document
-row is a single invocation of `bench_load /tmp/bench-5000 3`.
+of 5, taken from the quietest run:
 
 | corpus | read + parse | lookup + connection graph | total load | one-document edit |
 | --- | --- | --- | --- | --- |
-| 1500 documents | 256 ms | 310 ms | 606 ms | 8.2 ms |
+| 1500 documents | 281 ms | 311 ms | 592 ms | 8.5 ms |
 | 5000 documents | 1034 ms | 1345 ms | 2424 ms | 26.8 ms |
 
-Throughput at 1500 documents: 4.6 MB/s parsed, 2477 documents/s loaded. The gap
-between 606 ms of internal loading and 795 ms of measured cold start is process
+Throughput at 1500 documents: 4.2 MB/s parsed, 2534 documents/s loaded. The gap
+between 592 ms of internal loading and 795 ms of measured cold start is process
 startup, the LSP handshake, and the folder scan with its ignore files.
+
+These absolute figures move with machine load far more than any optimisation
+does: three consecutive runs of the same binary measured 592 ms, 792 ms and
+1321 ms. Treat them as an order of magnitude, not as a regression baseline.
+
+### Allocation profile
+
+Because wall-clock timing on a shared machine is that unreliable, the load path is
+also measured in allocations, which are deterministic for a given corpus.
+`cargo run --release --example alloc_load -- <corpus>` reports them per stage:
+
+| stage | allocations | bytes |
+| --- | --- | --- |
+| `markdown::scan` (block + inline) | 123,117 | 17.4 MB |
+| `mk_text` (line map) | 9,001 | 4.2 MB |
+| `scrape_text` (elements, includes scan) | 316,525 | 70.0 MB |
+| `build_cst` (scopes, child map) | 30,091 | 22.6 MB |
+| `Structure::of_cst` (AST, symbols) | 533,325 | 108.9 MB |
+| `Doc::try_load` (read + parse + index) | 1,074,248 | 222.0 MB |
+| `Folder::multi_file` (map + lookup + graph) | 2,095,805 | 241.1 MB |
+| one-document folder rebuild | 43,242 | 10.4 MB |
+
+Three changes cut the parse path roughly in half. `markdown::scan` no longer
+allocates a lowercased copy of every line plus four `format!` strings per line
+while probing for HTML block starts (312,387 → 123,117 allocations). `build_cst`
+stores its child map as indices into the element vector instead of copying every
+element twice, and sorts by permuting rather than cloning (339,399 → 30,091).
+`Conn::mk` iterates its symbol map by reference instead of materialising all
+24,028 symbols a second time to filter out the references.
+
+Together: `Doc::try_load` went from 1,572,826 to 1,074,248 allocations (−32%) and
+264 MB to 222 MB. Measured by interleaved A/B against the pre-change binary, so
+that machine drift affects both equally, `read+parse` is 10–18% faster and total
+load 7–11% faster. An A/A run of the same binary against itself puts the noise
+floor at ±1.4%, so the effect is well outside it.
+
+What is left, and why it is not done yet: `Folder::multi_file` is now the largest
+single block at 2.1M allocations, and `Structure::of_cst` the largest in the parse
+path at 533k. Both are dominated by deep clones of small values that are cloned
+because they are owned — `Scope::Doc(DocId)` carries three `String`s, so every
+scope clone allocates three times, and `Mapping::add_mut` has to place each
+element in both a forward map and an inverse index. Sharing those behind `Arc`
+would remove most of it, but `Scope::Doc` is constructed at 38 sites and `DocId`
+cloned at 63, so it is a wide change to a core type that needs its own A/B run.
 
 A full connection-graph rebuild per document edit is the original's behaviour
 too: `core.incremental_references` defaults to `false`, so both implementations
@@ -322,7 +365,8 @@ other order. Every value is the same.
 src/               the port, one module per F# source file
 tests/             ported test suites, one file per F# test module
 tests/common/      shared fixtures, mirroring Tests/Helpers.fs
-examples/          bench_load.rs (phase timings), dump_elements.rs (oracle)
+examples/          bench_load.rs (phase timings), alloc_load.rs (allocation
+                   counts), dump_elements.rs (parser oracle)
 bench/             gen_corpus.py, bench.py, lsp_smoke.py, fixtures/
 bench/oracle/      compare.py and the F# dumper: differential parser test
 ```

@@ -508,9 +508,12 @@ fn sort_elements(text: &Text, elements: &mut Vec<Element>) {
         elements.iter().enumerate().map(|(i, el)| (offsets(el), i)).collect();
     keyed.sort_by_key(|(off, i)| (*off, *i));
 
-    let old = std::mem::take(elements);
+    // Permuting by index moves each element once instead of cloning it.
+    let mut old: Vec<Option<Element>> =
+        std::mem::take(elements).into_iter().map(Some).collect();
+    elements.reserve(keyed.len());
     for (_, i) in keyed {
-        elements.push(old[i].clone());
+        elements.push(old[i].take().expect("a permutation visits each index once"));
     }
 }
 
@@ -566,17 +569,33 @@ pub fn build_cst(text: &Text, mut input_elements: Vec<Element>) -> Cst {
         }
     }
 
-    let mut cst_child_map = std::collections::BTreeMap::new();
-    for (parent_idx, child_indices) in child_map {
-        let mut children: Vec<Element> = child_indices.iter().map(|i| output_elements[*i].clone()).collect();
-        sort_elements(text, &mut children);
-        cst_child_map.insert(output_elements[parent_idx].clone(), children);
+    // Sort into document order, remembering where each element landed so the
+    // child map can hold indices rather than copies.
+    let offsets = |el: &Element| {
+        let range = el.range();
+        (text.position_to_offset(range.start), text.position_to_offset(range.end))
+    };
+
+    let mut indexed: Vec<(usize, Element)> = output_elements.into_iter().enumerate().collect();
+    // Stable, so elements sharing an offset keep their source order.
+    indexed.sort_by(|(_, a), (_, b)| offsets(a).cmp(&offsets(b)));
+
+    let mut new_index = vec![0usize; indexed.len()];
+    for (position, (old_index, _)) in indexed.iter().enumerate() {
+        new_index[*old_index] = position;
     }
+    let elements: Vec<Element> = indexed.into_iter().map(|(_, el)| el).collect();
 
-    let mut elements = output_elements;
-    sort_elements(text, &mut elements);
+    let child_map = child_map
+        .into_iter()
+        .map(|(parent_idx, child_indices)| {
+            let mut children: Vec<usize> = child_indices.iter().map(|i| new_index[*i]).collect();
+            children.sort_by(|a, b| offsets(&elements[*a]).cmp(&offsets(&elements[*b])));
+            (new_index[parent_idx], children)
+        })
+        .collect();
 
-    Cst { elements, child_map: cst_child_map }
+    Cst { elements, child_map }
 }
 
 pub fn parse(parser_settings: &ParserSettings, text: &Text) -> Structure {

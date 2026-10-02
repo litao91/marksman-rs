@@ -541,7 +541,9 @@ fn fmt_tag(node: &Node<Tag>) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct Cst {
     pub elements: Vec<Element>,
-    pub child_map: BTreeMap<Element, Vec<Element>>,
+    /// Parent to children, as indices into `elements`. Storing the elements
+    /// themselves would copy every element in the document twice.
+    pub child_map: BTreeMap<usize, Vec<usize>>,
 }
 
 impl Cst {
@@ -550,7 +552,13 @@ impl Cst {
     }
 
     pub fn children(&self, el: &Element) -> Vec<Element> {
-        self.child_map.get(el).cloned().unwrap_or_default()
+        let Some(idx) = self.elements.iter().position(|e| e == el) else {
+            return Vec::new();
+        };
+        match self.child_map.get(&idx) {
+            Some(children) => children.iter().map(|i| self.elements[*i].clone()).collect(),
+            None => Vec::new(),
+        }
     }
 
     /// Headings that are not nested under any other heading. For

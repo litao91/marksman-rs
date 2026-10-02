@@ -787,12 +787,14 @@ impl Conn {
             conn.add_symbol(Scope::Doc(doc), sym);
         }
 
-        // Only references need resolving; definitions are just indexed.
-        let sources: Vec<(Scope, SymRef)> = conn
-            .symbols
-            .to_seq()
-            .filter_map(|(scope, sym)| sym.as_ref().map(|r| (scope, r.clone())))
-            .collect();
+        // Only references need resolving; definitions are just indexed. Iterating
+        // by reference avoids cloning every symbol in the folder to find them.
+        let mut sources: Vec<(Scope, SymRef)> = Vec::new();
+        conn.symbols.iter(|scope, sym| {
+            if let Some(r) = sym.as_ref() {
+                sources.push((scope.clone(), r.clone()));
+            }
+        });
         for source in sources {
             conn.evaluate_reference(oracle, source);
         }
