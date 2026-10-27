@@ -146,8 +146,15 @@ pub fn doc_symbols(hierarchy: bool, is_emacs: bool, doc: &Doc) -> DocSymbols {
 
 pub fn workspace_symbols(query: &str, ws: &Workspace) -> Vec<SymbolInformation> {
     let mut out = Vec::new();
+    // Overlapping workspace folders can both claim the same file, so a document
+    // is only visited under the first folder that reaches it. Without this the
+    // same symbol is emitted once per enclosing folder.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for folder in ws.folders() {
         for doc in folder.docs() {
+            if !seen.insert(doc.uri().to_string()) {
+                continue;
+            }
             let index = doc.index();
             out.extend(
                 index
@@ -300,6 +307,24 @@ mod tests {
 
         assert!(workspace_symbols("zzz", &ws).is_empty());
         let _ = Config::default_config();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workspace_symbols_visit_a_shared_doc_once() {
+        // Two workspace folders where one nests inside the other both claim
+        // `inner/b.md`; its symbols must still be reported only once.
+        let dir = temp_dir("wsoverlap");
+        write(&dir, "a.md", "# Outer\n");
+        write(&dir, "inner/b.md", "# Inner\n");
+        let outer = load(&dir);
+        let inner = load(&dir.join("inner"));
+        let ws = Workspace::of_folders(None, vec![outer, inner]);
+
+        let found = workspace_symbols("", &ws);
+        let inner_hits = found.iter().filter(|s| s.name == "H1: Inner").count();
+        assert_eq!(inner_hits, 1, "shared doc emitted {inner_hits} times: {found:?}");
+        assert_eq!(found.len(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
